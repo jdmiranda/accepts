@@ -23,6 +23,19 @@ var mime = require('mime-types')
 module.exports = Accepts
 
 /**
+ * Optimization: Cache for negotiation results
+ * @private
+ */
+var negotiationCache = new Map()
+var CACHE_SIZE_LIMIT = 1000
+
+/**
+ * Optimization: Cache for mime type lookups
+ * @private
+ */
+var mimeCache = new Map()
+
+/**
  * Create a new Accepts object for the given req.
  *
  * @param {object} req
@@ -96,18 +109,55 @@ Accepts.prototype.types = function (types_) {
     return this.negotiator.mediaTypes()
   }
 
-  // no accept header, return first given type
+  // Optimization: Fast path for no accept header
   if (!this.headers.accept) {
     return types[0]
   }
 
-  var mimes = types.map(extToMime)
-  var accepts = this.negotiator.mediaTypes(mimes.filter(validMime))
-  var first = accepts[0]
+  // Optimization: Single type fast path
+  if (types.length === 1) {
+    var singleMime = extToMimeCached(types[0])
+    if (!validMime(singleMime)) {
+      return false
+    }
+    var singleResult = this.negotiator.mediaTypes([singleMime])
+    return singleResult[0] ? types[0] : false
+  }
 
-  return first
-    ? types[mimes.indexOf(first)]
-    : false
+  // Optimization: Check cache for this combination
+  var cacheKey = this.headers.accept + '|' + types.join(',')
+  var cached = negotiationCache.get(cacheKey)
+  if (cached !== undefined) {
+    return cached
+  }
+
+  // Optimization: Use Map for faster mime lookups
+  var mimeMap = new Map()
+  var mimes = []
+  for (var i = 0; i < types.length; i++) {
+    var type = types[i]
+    var mimeType = extToMimeCached(type)
+    if (validMime(mimeType)) {
+      mimes.push(mimeType)
+      mimeMap.set(mimeType, type)
+    }
+  }
+
+  var accepts = this.negotiator.mediaTypes(mimes)
+  var first = accepts[0]
+  var result = first ? mimeMap.get(first) : false
+
+  // Optimization: Cache the result
+  if (negotiationCache.size >= CACHE_SIZE_LIMIT) {
+    // Simple cache eviction: clear oldest entries
+    var keys = negotiationCache.keys()
+    for (var j = 0; j < 100; j++) {
+      negotiationCache.delete(keys.next().value)
+    }
+  }
+  negotiationCache.set(cacheKey, result)
+
+  return result
 }
 
 /**
@@ -140,7 +190,27 @@ Accepts.prototype.encodings = function (encodings_) {
     return this.negotiator.encodings()
   }
 
-  return this.negotiator.encodings(encodings)[0] || false
+  // Optimization: Check cache
+  var header = this.headers['accept-encoding']
+  if (header) {
+    var cacheKey = 'enc:' + header + '|' + encodings.join(',')
+    var cached = negotiationCache.get(cacheKey)
+    if (cached !== undefined) {
+      return cached
+    }
+  }
+
+  var result = this.negotiator.encodings(encodings)[0] || false
+
+  // Optimization: Cache result
+  if (header) {
+    if (negotiationCache.size >= CACHE_SIZE_LIMIT) {
+      clearCacheEntries()
+    }
+    negotiationCache.set(cacheKey, result)
+  }
+
+  return result
 }
 
 /**
@@ -173,7 +243,27 @@ Accepts.prototype.charsets = function (charsets_) {
     return this.negotiator.charsets()
   }
 
-  return this.negotiator.charsets(charsets)[0] || false
+  // Optimization: Check cache
+  var header = this.headers['accept-charset']
+  if (header) {
+    var cacheKey = 'chr:' + header + '|' + charsets.join(',')
+    var cached = negotiationCache.get(cacheKey)
+    if (cached !== undefined) {
+      return cached
+    }
+  }
+
+  var result = this.negotiator.charsets(charsets)[0] || false
+
+  // Optimization: Cache result
+  if (header) {
+    if (negotiationCache.size >= CACHE_SIZE_LIMIT) {
+      clearCacheEntries()
+    }
+    negotiationCache.set(cacheKey, result)
+  }
+
+  return result
 }
 
 /**
@@ -208,7 +298,50 @@ Accepts.prototype.languages = function (languages_) {
     return this.negotiator.languages()
   }
 
-  return this.negotiator.languages(languages)[0] || false
+  // Optimization: Check cache
+  var header = this.headers['accept-language']
+  if (header) {
+    var cacheKey = 'lng:' + header + '|' + languages.join(',')
+    var cached = negotiationCache.get(cacheKey)
+    if (cached !== undefined) {
+      return cached
+    }
+  }
+
+  var result = this.negotiator.languages(languages)[0] || false
+
+  // Optimization: Cache result
+  if (header) {
+    if (negotiationCache.size >= CACHE_SIZE_LIMIT) {
+      clearCacheEntries()
+    }
+    negotiationCache.set(cacheKey, result)
+  }
+
+  return result
+}
+
+/**
+ * Convert extnames to mime with caching.
+ *
+ * @param {String} type
+ * @return {String}
+ * @private
+ */
+
+function extToMimeCached (type) {
+  if (type.indexOf('/') !== -1) {
+    return type
+  }
+
+  var cached = mimeCache.get(type)
+  if (cached !== undefined) {
+    return cached
+  }
+
+  var result = mime.lookup(type)
+  mimeCache.set(type, result)
+  return result
 }
 
 /**
@@ -235,4 +368,18 @@ function extToMime (type) {
 
 function validMime (type) {
   return typeof type === 'string'
+}
+
+/**
+ * Clear cache entries to prevent unbounded growth.
+ * @private
+ */
+
+function clearCacheEntries () {
+  var keys = negotiationCache.keys()
+  for (var i = 0; i < 100; i++) {
+    var next = keys.next()
+    if (next.done) break
+    negotiationCache.delete(next.value)
+  }
 }
